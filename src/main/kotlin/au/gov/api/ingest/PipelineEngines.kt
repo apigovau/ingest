@@ -1,15 +1,18 @@
 package au.gov.api.ingest
 
 import au.gov.api.config.Config
+import au.gov.api.ingest.converters.models.ObjectDocument
+import au.gov.api.ingest.converters.swaggerToMarkdown.SwaggerToMarkdownConverter
 import au.gov.api.ingest.preview.EngineImpl
-import io.github.swagger2markup.Swagger2MarkupConverter
-import io.github.swagger2markup.builder.Swagger2MarkupConfigBuilder
-import org.apache.commons.configuration2.builder.fluent.Configurations
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.ow2.easywsdl.wsdl.WSDLFactory
 import org.ow2.easywsdl.wsdl.api.Description
+import org.springframework.core.io.ClassPathResource
+import org.springframework.util.FileCopyUtils
 import org.xml.sax.InputSource
 import java.io.ByteArrayInputStream
 import java.io.StringReader
+import java.nio.charset.StandardCharsets
 import java.util.*
 import javax.xml.parsers.DocumentBuilderFactory
 
@@ -165,6 +168,8 @@ class MergeMarkdownEngine() : Engine() {
         var to = ""
     }
 
+    data class MergeActions(val actionList: List<MergeAction>? = null)
+
     var mergeActions: List<MergeAction> = listOf()
 
     var mainMarkdown = ""
@@ -195,8 +200,13 @@ class MergeMarkdownEngine() : Engine() {
     }
 
     override fun setData(vararg input: Any) {
-        inputData = (input.filter { config!!["map"].equals((it as Pair<String, Any>).first) }
-                .first() as Pair<String, Any>).second.toString()
+        try {
+            inputData = (input.filter { config!!["map"].equals((it as Pair<String, Any>).first) }
+                    .first() as Pair<String, Any>).second.toString()
+        } catch (e: Exception) {
+            inputData = config!!["map"]!!
+        }
+
         inputData = getMappingString(inputData)
         mergeActions = parseMappingAction(inputData)
         var lastTwo = input.filter { inputIds!!.contains((it as Pair<String, Any>).first) }
@@ -205,57 +215,19 @@ class MergeMarkdownEngine() : Engine() {
     }
 
     private fun getMappingString(input: String): String {
-        var contentStart = input.indexOf("# MergeMapping")
-        var contentEnd = input.indexOf("---", input.indexOf("---") + 3)
-        var releventString = input.substring(contentStart, contentEnd)
-        return releventString
+        if (input.startsWith('{')) {
+            return input
+        } else {
+            var contentStart = input.indexOf("# MergeMapping") + 14
+            var contentEnd = input.indexOf("---", input.indexOf("---") + 3)
+            var releventString = input.substring(contentStart, contentEnd).trim()
+            return releventString
+        }
     }
 
     private fun parseMappingAction(input: String): List<MergeAction> {
-        var maps: MutableList<String> = mutableListOf()
-        var tempStr = ""
-        var tempActionStr = ""
-        var inQuotes = false
-        input.forEach {
-            if (it.equals('\"')) {
-                inQuotes = !inQuotes
-                if (tempStr.trim().isNotBlank()) {
-                    maps.add(tempStr.replace("\"", "").trim())
-                }
-                if (tempActionStr.trim().isNotBlank()) {
-                    maps.add(tempActionStr.replace("\"", "").trim())
-                    tempActionStr = ""
-                }
-                tempStr = ""
-            }
-            if (inQuotes) {
-                tempStr += it
-            } else {
-                if (maps.count() > 0) {
-                    tempActionStr += it
-                }
-            }
-        }
-        var tempMaps: MutableList<String> = mutableListOf()
-        var output: MutableList<MergeAction> = mutableListOf()
-
-        maps.forEach {
-            if (it.count() > 1) {
-                tempMaps.add(it)
-            }
-        }
-        maps = tempMaps
-
-        var i = 0
-        while (i < maps.count()) {
-            var tempAction: MergeAction = MergeAction()
-            tempAction.from = maps[i]
-            tempAction.action = MergeType.valueOf(maps[i + 1])
-            tempAction.to = maps[i + 2]
-            output.add(tempAction)
-            i += 3
-        }
-        return output.toList()
+        val actions = ObjectMapper().readValue(input, MergeActions::class.java)
+        return actions.actionList!!
     }
 
     private fun getLevel(input: String): String {
@@ -277,17 +249,37 @@ class MergeMarkdownEngine() : Engine() {
     }
 }
 
+
 @EngineImpl("swagger",
         "markdown",
         "Converts swagger documents to markdown")
 class SwaggerToMarkdownEngine() : Engine() {
+    var docConfig: String? = null
+
+    override fun setData(vararg input: Any) {
+        inputData = (input.filter { inputIds!!.contains((it as Pair<String, Any>).first) }
+                .first() as Pair<String, Any>).second.toString()
+
+        if (config!!.containsKey("docConfig")) {
+            docConfig = (input.filter { config!!["docConfig"].equals((it as Pair<String, Any>).first) }
+                    .first() as Pair<String, Any>).second.toString()
+        }
+
+    }
+
     override fun execute() {
-        var configs = Configurations().properties("config.properties")
-        var swagger2MarkupConfig = Swagger2MarkupConfigBuilder(configs).build()
-        var converterBuilder = Swagger2MarkupConverter.from(inputData)
-        converterBuilder.withConfig(swagger2MarkupConfig)
-        var converter = converterBuilder.build()
-        output = getPagesFromSwagger(converter.toString())
+        var isYaml = !inputData.trim().startsWith('{')
+        var document = ObjectDocument(inputData, isYaml)
+        var swaggerVersion = 2
+        try {
+            swaggerVersion = (document.getValue(".openapi") as String).split('.').first().toInt()
+        } catch (e: Exception) {
+        }
+        var configFile = if (docConfig == null) String(FileCopyUtils.copyToByteArray(ClassPathResource("SwaggerMdConfig.$swaggerVersion.json").inputStream), StandardCharsets.UTF_8) else docConfig!!
+
+
+        var config = ObjectDocument(configFile, false)
+        output = SwaggerToMarkdownConverter(document, config).convert()
     }
 
     private fun getPagesFromSwagger(swaggerJson: String): String {
